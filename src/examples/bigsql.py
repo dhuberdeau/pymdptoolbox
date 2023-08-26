@@ -11,6 +11,7 @@ import sqlite3
 from numpy import arange
 from numpy.random import permutation, random, randint
 from scipy.sparse import dok_matrix
+from mdptoolbox import mdp
 
 from mdp import ValueIteration
 from mdpsql import ValueIteration as ValueIterationSQL

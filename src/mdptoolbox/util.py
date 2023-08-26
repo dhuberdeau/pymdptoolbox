@@ -4,7 +4,8 @@
 
 The ``util`` module provides functions to check that an MDP is validly
 described. There are also functions for working with MDPs while they are being
-solved.
+solved, and for manipulating raw data into formats that the MDP functions can
+solve.
 
 Available functions
 -------------------
@@ -21,6 +22,14 @@ Available functions
     Check if a matrix is square
 :func:`~mdptoolbox.util.isStochastic`
     Check if a matrix is row stochastic
+:func:`~mdptoolbox.util.fit`
+    Compute transition and reward matricies from a set of trajectories
+:func:`~mdptoolbox.util.predict`
+    Predict the action sequences from a set of trajectories
+:func:`~mdptoolbox.util.score`
+    Score the deviation of a trajectory from optimal policy
+:func:`~mdptoolbox.util.simulate`
+    Simulate a trajectory through state space under the current MDP policy
 
 """
 
@@ -56,6 +65,8 @@ Available functions
 import numpy as _np
 
 import mdptoolbox.error as _error
+
+import mdptoolbox as _mdp
 
 _MDPERR = {
 "mat_nonneg" :
@@ -309,3 +320,331 @@ def getSpan(array):
 
     """
     return array.max() - array.min()
+
+class MDP_handle(object):
+
+    def __init__(self, S=None, P=None, A=None, R=None, gamma = None):
+        self.S = S
+        self.P = P
+        self.A = A
+        self.R = R
+        self.gamma = gamma
+        self._P_iter = []
+        self._S_index = []
+        self._solver = None
+
+    def fit(self, X, y, solver="PolicyIteration"):
+        """Compute an optimal policy by first estimating a state
+        transition matrix and reward matrix from sample trajectories
+        through state space specified as input.
+
+        Let S be the number of states, A the number of possible
+        actions, N the number of trials, and T the duration of a
+        given trajectory.
+
+        Arguments
+        ---------
+        X : matrix
+            A matrix of trajectories through state space. X should have shape
+            (N x T).
+        y : array
+            The actions taken for each state trajectory in X. y should have
+            shape (N x 1).
+        solver: string
+            The preferred MDP solver (default Policy Iteration)
+
+        """
+        self._computeTransitionMatrix(X, y)
+        self._computeRewardMatrix()
+
+        if self.gamma is None:
+            self.gamma = .9
+
+        # Transpose P: MDP solvers need P to be (A,S,S)
+        # whereas this module stores P as (S,S,A)
+        # note: P must have rows that sum to 1
+        P_trans = _np.transpose(self.P, (2,0,1))
+        self._solver = _mdp.mdp.PolicyIteration(P_trans, self.R, self.gamma)
+        self._solver.run()
+
+        return self
+
+    def predict(self,X):
+        # get the optimal policy:
+        pi = self._solver.policy
+
+        aq_pred = _np.empty((_np.shape(X)[0], _np.shape(X)[-1]))
+        for i_trial in range(0,len(X)):
+            sq = self._stateTransitionSequence(X[i_trial])
+            this_aq = []
+            for i_sample in range(0, _np.shape(X)[-1]):
+                this_state_ind = self._convertDimensionIndexToStateIndex(
+                    sq[:, i_sample])
+                aq_pred[i_trial, i_sample] = pi[this_state_ind]
+                # this_aq = _np.append(this_aq, pi[this_state_ind])
+
+        # y_pred = self.A(aq_pred)
+        y_pred = _np.empty((_np.shape(X)[0], _np.shape(X)[-1]))
+        for i_trial in range(0,len(X)):
+            y_pred[i_trial, :] = [self.A[
+                int(aq_pred[i_trial,i_sample])] for i_sample in range(
+                0, _np.shape(X)[-1])]
+
+        return y_pred
+
+
+    def score(self,X,y):
+
+        y_pred = self.predict(X)
+        action_error = _np.subtract(y_pred, y)
+
+        return action_error
+
+
+    def simulate(self, X0, n_steps):
+        # given an initial state, predict a
+        # state-transition sequence and action sequence
+        # assuming the policy is followed.
+
+        pi = self._solver.policy
+
+        # X_pred = _np.empty((1, _np.shape(X0)[1], n_steps))
+        X_pred = []
+        y_pred = _np.empty(n_steps)
+        sq_ind_pred = _np.empty(n_steps)
+        aq_pred = _np.empty(n_steps)
+
+        sq0 = self._stateTransitionSequence(X0[0])
+        this_state_ind = self._convertDimensionIndexToStateIndex(sq0)
+        for i_sample in range(0, n_steps):
+            this_action_ind = pi[this_state_ind]
+            this_state_ind = _np.random.choice(
+                _np.array(range(0,_np.shape(self.P)[0])),
+                p=self.P[this_state_ind, :, this_action_ind])
+
+            aq_pred[i_sample] = this_action_ind
+            y_pred[i_sample] = self.A[this_action_ind]
+
+            sq_ind_pred[i_sample] = this_state_ind
+            # X_pred[0,:,i_sample] = self.S[
+            #     self._convertStateIndexToDimensionIndex(this_state_ind)]
+
+            # X_pred[i_sample] = self._convertStateIndexToDimensionIndex(
+                # this_state_ind)
+            X_pred = _np.append(X_pred,
+                self._convertStateIndexToDimensionIndex(
+                this_state_ind))
+
+        X_pred = _np.reshape(X_pred, (1, _np.shape(X0)[1], n_steps))
+
+        return (X_pred, y_pred)
+
+    def setP(self, P):
+        self.P = P
+
+
+    def setS(self, S):
+        self.S = S
+
+
+    def setA(self, A):
+        self.A = A
+
+
+    def _stateTransitionSequence(self, x):
+        """Transform a trajectory, x, through a state-space, S, into a
+        sequence of states and actions.
+
+        The object must have the following already defined:
+        S : array
+            An array of arrays defining the discritization of the state-
+            space. There should be one array for each dimension, and the
+            values are the state borders along that dimension. The
+            output of this function will be denominated as the index
+            of each of these arrays.
+
+        Arguments
+        ---------
+        x : array
+            A trajectory through state-space. One array for each
+            dimension of the state-space. Each array should have equal
+            numbers of elements.
+
+        Returns
+        =======
+        sq : array
+            The sequence of states, discritized according to S.
+
+
+        """
+        sq = _np.empty((_np.shape(self.S)[0], _np.shape(x)[-1]))
+
+        for i_dim in range(len(x)):
+            sq[i_dim, :] = _np.digitize(x[i_dim], self.S[i_dim])
+
+        return sq
+
+    def _actionTransitionSequence(self, a):
+        """Transform a trajectory, x, through a state-space, S, into a
+        sequence of states and actions.
+
+        The object must have the following already defined:
+        A : array
+            An array defining the discritization of the action-
+            space. There should be one array, and the
+            values are the bins into which to discritize the actions, a.
+
+        Arguments
+        ---------
+        a : array
+            The actions taken for each state value in x. a should have
+            the same number of elements as each array in x.
+
+        Returns
+        =======
+        aq : array
+            The sequence of actions, discritized according to A.
+
+
+        """
+
+        aq = _np.digitize(a, self.A)
+
+        return aq
+
+
+    def _incrementTransitionMatrix(self, sq, aq):
+        """Add a trajectory defined as a state sequence, sq, to a
+        growing state transition matrix, P, given action sequence aq.
+
+        The object must already have the following defined:
+        S : array
+            A state space definition
+        A : array
+            An action space definition
+
+        Arguments
+        ---------
+        sq : array
+            A sequence of state transitions, denominated as indicies
+            of the state space defined elsewhere in S.
+        aq : array
+            A sequence of actions, denominated as indicies of the action space
+            defined elsewhere in A.
+
+        """
+
+        if len(self._P_iter) == 0:
+            # count up the number of states in S
+            dims = []
+            for i_dim in range(0, len(self.S)):
+                dims = _np.append(dims, len(self.S[i_dim]))
+            n_states = int(_np.prod(dims))
+
+            # define the iterator for the transition
+            # matrix
+            self._P_iter = _np.zeros((n_states,n_states,len(self.A)))
+
+            # define the overall state index from
+            # state definition S
+            state_range = _np.array(range(0, n_states))
+            dims_int = [int(dims[i_]) for i_ in range(len(dims))]
+            self._S_index = _np.reshape(state_range, dims_int)
+
+        # increment _P_iter
+        for i_sample in range(0,len(sq)-1):
+            this_state_ind = self._convertDimensionIndexToStateIndex(
+                    sq[:,i_sample])
+            # this_state_ind = self._S_index[dim_state_inds]
+
+            next_state_ind = self._convertDimensionIndexToStateIndex(
+                    sq[:,i_sample + 1])
+            # next_state_ind = self._S_index[dim_state_inds]
+
+            # dim_state_inds = _np.array([], int)
+            # for i_dim in range(0,len(sq[i_sample+1])):
+            #     dim_state_inds = np.append(dim_state_inds,
+            #         int(sq[i_sample+1][i_dim]))
+            # next_state_ind = self._S_index[tuple(dim_state_inds)]
+
+            this_action_ind = int(aq[i_sample])
+
+            self._P_iter[this_state_ind][
+                    next_state_ind][
+                    this_action_ind] = self._P_iter[
+                        this_state_ind][
+                        next_state_ind][
+                        this_action_ind] + 1
+
+        return self
+
+
+    def _computeTransitionMatrix(self, X, a):
+
+        for i_trial in range(0, len(X)):
+            sq = self._stateTransitionSequence(
+                X[i_trial])
+            aq = self._actionTransitionSequence(
+                 a[i_trial])
+            self._incrementTransitionMatrix(sq, aq)
+
+        P_0 = _np.copy(self._P_iter)
+        for i_action in range(0, _np.shape(self._P_iter)[2]):
+            P_action = P_0[:,:,i_action]
+            P_row_sum = _np.sum(P_action, 1)
+            P_prior = [1/_np.shape(P_0)[0] for i_ in
+                         range(0, _np.shape(P_0)[0])]
+            for i_state in range(_np.shape(P_action)[0]):
+                # P_action[i_state, :] = _np.divide(
+                #     P_action[i_state, :], P_row_sum[i_state])
+                if P_row_sum[i_state] == 0:
+                    # no samples in this row
+                    P_action[i_state, :] = P_prior
+                else:
+                    likelihood = _np.divide(P_action[i_state, :],
+                            P_row_sum[i_state])
+                    posterior = [likelihood[i_]*P_prior[i_]
+                        for i_ in range(0, len(P_prior))]
+                    P_action[i_state, :] = _np.divide(posterior,
+                        _np.sum(posterior))
+            P_0[:,:,i_action] = P_action
+
+        self.P = P_0
+        return self
+
+
+    def _computeRewardMatrix(self):
+        # Assume all actions have equally reward/cose, and define
+        # state rewards as the column density across states
+
+        P_0 = _np.copy(self._P_iter)
+        R_0 = _np.zeros((_np.shape(self._P_iter)[0],
+            _np.shape(self._P_iter)[-1]))
+        for i_action in range(0, len(self.A)):
+            P_action = P_0[:,:,i_action]
+            P_col_sum = _np.sum(P_action, 0)
+            P_total_sum = _np.sum(P_col_sum)
+            if P_total_sum == 0:
+                P_density = _np.zeros(_np.shape(R_0)[0])
+            else:
+                P_density = _np.divide(P_col_sum, P_total_sum)
+            R_0[:, i_action] = P_density
+
+        self.R = R_0
+
+        return self
+
+    def _convertDimensionIndexToStateIndex(self, sq_sample):
+
+        dim_state_inds = _np.empty(_np.shape(sq_sample)[0], dtype=int)
+        for i_dim in range(0,_np.shape(sq_sample)[0]):
+            dim_state_inds[i_dim] = int(sq_sample[i_dim])
+
+        this_state_ind = self._S_index[tuple(dim_state_inds)]
+
+        return this_state_ind
+
+    def _convertStateIndexToDimensionIndex(self, sq_ind_sample):
+
+        sq_sample = _np.where(self._S_index == sq_ind_sample)
+        return sq_sample
